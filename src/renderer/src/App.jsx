@@ -13,6 +13,22 @@ function runBadge(run) {
   return <span className={`badge ${cls}`}>{c}</span>
 }
 
+// Subtitle for a run: the triggering commit's message (first line), or "Manual"
+// when the run was started by hand (workflow_dispatch).
+function runSubtitle(run) {
+  if (run.event === 'workflow_dispatch') return 'Manual'
+  const msg = (run.headCommitMessage || run.displayTitle || '').split('\n')[0].trim()
+  return msg || run.event || '—'
+}
+
+// Human-readable message for the current diff progress phase.
+function diffProgressMessage(p) {
+  if (!p) return 'Preparing…'
+  if (p.message) return p.message
+  if (p.phase === 'compare') return 'Comparing images…'
+  return 'Working…'
+}
+
 export default function App() {
   const [settings, setSettings] = useState({ hasToken: false })
   const [user, setUser] = useState(null)
@@ -27,6 +43,8 @@ export default function App() {
   const [workflows, setWorkflows] = useState([])
   const [wfState, setWfState] = useState({ loading: false, error: null })
   const [selectedWorkflow, setSelectedWorkflow] = useState(null)
+  // Workflow ids that appeared for the first time on the most recent refresh.
+  const [newWorkflowIds, setNewWorkflowIds] = useState(() => new Set())
 
   const [runs, setRuns] = useState([])
   const [runsState, setRunsState] = useState({ loading: false, error: null })
@@ -39,6 +57,7 @@ export default function App() {
   // Diff
   const [diffResult, setDiffResult] = useState(null)
   const [diffState, setDiffState] = useState({ loading: false, error: null })
+  const [diffProgress, setDiffProgress] = useState(null)
 
   // ---- initial load -----------------------------------------------------
   useEffect(() => {
@@ -52,6 +71,12 @@ export default function App() {
       }
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Progress updates streamed from the main process during a diff.
+  useEffect(() => {
+    const off = api.onDiffProgress((p) => setDiffProgress(p))
+    return off
   }, [])
 
   // Re-load the persisted repo → workflow → run → artifact chain so the same
@@ -99,6 +124,14 @@ export default function App() {
 
     if (s.selectedArtifact && artsList.some((a) => a.id === s.selectedArtifact.id)) {
       setSelectedArtifact(s.selectedArtifact)
+      // Auto-download and diff the restored artifact (served from the local
+      // cache when available).
+      runDiff({
+        repo: s.selectedRepo,
+        runId: s.selectedRun.id,
+        artifact: s.selectedArtifact,
+        baselineFolder: s.baselineFolder
+      })
     }
   }
 
@@ -178,6 +211,7 @@ export default function App() {
       selectedRun: null,
       selectedArtifact: null
     })
+    setNewWorkflowIds(new Set())
     setWfState({ loading: true, error: null })
     try {
       const wf = await api.listWorkflows(repoFullName)
@@ -185,6 +219,46 @@ export default function App() {
       setWfState({ loading: false, error: null })
     } catch (e) {
       setWfState({ loading: false, error: e.message })
+    }
+  }
+
+  // Refresh handlers reload a single selector's contents without disturbing the
+  // current selection or the downstream selectors.
+  const refreshWorkflows = async () => {
+    if (!selectedRepo) return
+    setWfState({ loading: true, error: null })
+    try {
+      const fresh = await api.listWorkflows(selectedRepo)
+      const prevIds = new Set(workflows.map((w) => w.id))
+      setNewWorkflowIds(new Set(fresh.filter((w) => !prevIds.has(w.id)).map((w) => w.id)))
+      setWorkflows(fresh)
+      setWfState({ loading: false, error: null })
+    } catch (e) {
+      setWfState({ loading: false, error: e.message })
+    }
+  }
+
+  const refreshRuns = async () => {
+    if (!selectedRepo || !selectedWorkflow) return
+    setRunsState({ loading: true, error: null })
+    try {
+      const fresh = await api.listRuns(selectedRepo, selectedWorkflow.id)
+      setRuns(fresh)
+      setRunsState({ loading: false, error: null })
+    } catch (e) {
+      setRunsState({ loading: false, error: e.message })
+    }
+  }
+
+  const refreshArtifacts = async () => {
+    if (!selectedRepo || !selectedRun) return
+    setArtState({ loading: true, error: null })
+    try {
+      const fresh = await api.listArtifacts(selectedRepo, selectedRun.id)
+      setArtifacts(fresh)
+      setArtState({ loading: false, error: null })
+    } catch (e) {
+      setArtState({ loading: false, error: e.message })
     }
   }
 
@@ -216,11 +290,12 @@ export default function App() {
     }
   }
 
-  const pickArtifact = async (artifact) => {
-    setSelectedArtifact(artifact)
-    api.saveSettings({ selectedArtifact: artifact })
+  // Download + diff a selected artifact. Repo/run are passed explicitly so this
+  // works both from a click (using component state) and from startup restore
+  // (where that state hasn't settled yet).
+  const runDiff = async ({ repo, runId, artifact, baselineFolder }) => {
     setDiffResult(null)
-    if (!settings.baselineFolder) {
+    if (!baselineFolder) {
       setDiffState({ loading: false, error: 'Select a baseline folder first (step 1).' })
       return
     }
@@ -228,19 +303,34 @@ export default function App() {
       setDiffState({ loading: false, error: 'This artifact has expired and cannot be downloaded.' })
       return
     }
+    setDiffProgress({ phase: 'download', message: 'Preparing…' })
     setDiffState({ loading: true, error: null })
     try {
       const res = await api.downloadAndDiff({
-        repo: selectedRepo,
-        runId: selectedRun.id,
+        repo,
+        runId,
         artifactId: artifact.id,
-        artifactName: artifact.name
+        artifactName: artifact.name,
+        createdAt: artifact.createdAt
       })
       setDiffResult(res)
       setDiffState({ loading: false, error: null })
     } catch (e) {
       setDiffState({ loading: false, error: e.message })
+    } finally {
+      setDiffProgress(null)
     }
+  }
+
+  const pickArtifact = async (artifact) => {
+    setSelectedArtifact(artifact)
+    api.saveSettings({ selectedArtifact: artifact })
+    await runDiff({
+      repo: selectedRepo,
+      runId: selectedRun.id,
+      artifact,
+      baselineFolder: settings.baselineFolder
+    })
   }
 
   const resolveDiff = async (key) => {
@@ -342,7 +432,11 @@ export default function App() {
             getId={(w) => w.id}
             getPrimary={(w) => w.name}
             getSecondary={(w) => w.path}
+            getBadge={(w) =>
+              newWorkflowIds.has(w.id) ? <span className="badge st-new">New</span> : null
+            }
             onSelect={pickWorkflow}
+            onRefresh={refreshWorkflows}
             disabled={!selectedRepo}
             disabledHint="Select a repository first"
             emptyText="No workflows found."
@@ -360,9 +454,10 @@ export default function App() {
             selectedId={selectedRun?.id}
             getId={(r) => r.id}
             getPrimary={(r) => `#${r.runNumber} · ${r.headBranch || ''}`}
-            getSecondary={(r) => new Date(r.createdAt).toLocaleString()}
+            getSecondary={runSubtitle}
             getBadge={runBadge}
             onSelect={pickRun}
+            onRefresh={refreshRuns}
             disabled={!selectedWorkflow}
             disabledHint="Select a workflow first"
             emptyText="No runs found."
@@ -384,6 +479,7 @@ export default function App() {
               `${(a.sizeInBytes / 1024).toFixed(0)} KB${a.expired ? ' · expired' : ''}`
             }
             onSelect={pickArtifact}
+            onRefresh={refreshArtifacts}
             disabled={!selectedRun}
             disabledHint="Select a run first"
             emptyText="No artifacts on this run."
@@ -406,7 +502,22 @@ export default function App() {
         {diffState.loading ? (
           <div className="placeholder">
             <div className="spinner" />
-            <p>Downloading artifact and comparing images…</p>
+            <p>{diffProgressMessage(diffProgress)}</p>
+            {diffProgress?.phase === 'compare' && diffProgress.total > 0 && (
+              <div className="progress-wrap">
+                <div className="progress-bar">
+                  <div
+                    className="progress-fill"
+                    style={{
+                      width: `${Math.round((diffProgress.done / diffProgress.total) * 100)}%`
+                    }}
+                  />
+                </div>
+                <div className="muted progress-count">
+                  {diffProgress.done} / {diffProgress.total} images compared
+                </div>
+              </div>
+            )}
           </div>
         ) : diffState.error ? (
           <div className="placeholder">

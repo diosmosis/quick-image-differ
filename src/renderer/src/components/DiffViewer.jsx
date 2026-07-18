@@ -63,10 +63,17 @@ export default function DiffViewer({ result, getImages, onResolve, baselineFolde
   const [resolving, setResolving] = useState(false)
   const [notice, setNotice] = useState(null)
   const [zoom, setZoom] = useState(1)
+  // Bumped to force the currently-selected images to reload (e.g. after a resolve
+  // when the selection stays put but the baseline changed).
+  const [imgRefresh, setImgRefresh] = useState(0)
 
   // Live pane-body elements, so scrolling one scrolls the others identically.
   const bodies = useRef({})
   const syncing = useRef(false)
+  // Last known position of the selection within the filtered list, and a ref to
+  // the selected row so it can be scrolled into view.
+  const lastIndexRef = useRef(0)
+  const selectedEntryRef = useRef(null)
   const registerBody = (title, el) => {
     if (el) bodies.current[title] = el
     else delete bodies.current[title]
@@ -94,16 +101,52 @@ export default function DiffViewer({ result, getImages, onResolve, baselineFolde
     return items.filter((i) => i.status === filter)
   }, [items, filter])
 
-  // Keep a valid selection as filters/results change.
+  // Keep a valid selection as filters/results change. When the selected item
+  // disappears (e.g. after resolving it out of the current filter), keep the
+  // same list position instead of jumping back to the top — so the next item
+  // slides into the selection and the user can keep stepping through diffs.
   useEffect(() => {
     if (filtered.length === 0) {
       setSelectedKey(null)
       return
     }
-    if (!filtered.some((i) => i.key === selectedKey)) {
-      setSelectedKey(filtered[0].key)
+    const idx = filtered.findIndex((i) => i.key === selectedKey)
+    if (idx >= 0) {
+      lastIndexRef.current = idx
+      return
     }
+    const target = Math.min(lastIndexRef.current, filtered.length - 1)
+    lastIndexRef.current = target
+    setSelectedKey(filtered[target].key)
   }, [filtered, selectedKey])
+
+  // Arrow Up/Down move the selection in the file list.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return
+      const el = document.activeElement
+      const tag = el?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el?.isContentEditable) {
+        return
+      }
+      if (filtered.length === 0) return
+      e.preventDefault()
+      const cur = Math.max(0, filtered.findIndex((i) => i.key === selectedKey))
+      const next =
+        e.key === 'ArrowDown'
+          ? Math.min(cur + 1, filtered.length - 1)
+          : Math.max(cur - 1, 0)
+      setNotice(null)
+      setSelectedKey(filtered[next].key)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [filtered, selectedKey])
+
+  // Keep the selected row visible as the selection moves.
+  useEffect(() => {
+    selectedEntryRef.current?.scrollIntoView({ block: 'nearest' })
+  }, [selectedKey])
 
   // Load the three images for the selected entry.
   useEffect(() => {
@@ -113,7 +156,6 @@ export default function DiffViewer({ result, getImages, onResolve, baselineFolde
       return
     }
     setImgLoading(true)
-    setNotice(null)
     getImages(selectedKey)
       .then((data) => {
         if (!cancelled) setImages(data)
@@ -127,7 +169,7 @@ export default function DiffViewer({ result, getImages, onResolve, baselineFolde
     return () => {
       cancelled = true
     }
-  }, [selectedKey, getImages])
+  }, [selectedKey, getImages, imgRefresh])
 
   const selected = items.find((i) => i.key === selectedKey) || null
 
@@ -137,9 +179,10 @@ export default function DiffViewer({ result, getImages, onResolve, baselineFolde
     setNotice(null)
     try {
       await onResolve(selected.key)
-      // Refresh the displayed images (baseline now matches artifact).
-      const data = await getImages(selected.key)
-      setImages(data)
+      // Reload whatever is now selected: if the resolved item left the filter,
+      // the selection moves to the next item; if it stayed, its images refresh
+      // (baseline now matches artifact).
+      setImgRefresh((n) => n + 1)
       setNotice('Baseline updated from artifact image.')
     } catch (e) {
       setNotice(e.message)
@@ -161,6 +204,11 @@ export default function DiffViewer({ result, getImages, onResolve, baselineFolde
           {result.strippedPrefix && (
             <span className="muted" title="Common leading folder stripped from the artifact so its folders line up with the baseline">
               {' '}· aligned from <code>{result.strippedPrefix}/</code>
+            </span>
+          )}
+          {result.fromCache && (
+            <span className="muted" title="Loaded from the local artifact cache instead of re-downloading">
+              {' '}· cached
             </span>
           )}
           <span className="chips">
@@ -220,8 +268,12 @@ export default function DiffViewer({ result, getImages, onResolve, baselineFolde
             {filtered.map((item) => (
               <li key={item.key}>
                 <button
+                  ref={item.key === selectedKey ? selectedEntryRef : null}
                   className={`entry ${item.key === selectedKey ? 'selected' : ''}`}
-                  onClick={() => setSelectedKey(item.key)}
+                  onClick={() => {
+                    setNotice(null)
+                    setSelectedKey(item.key)
+                  }}
                 >
                   <span className="entry-name" title={item.name}>
                     {item.name}

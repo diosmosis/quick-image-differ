@@ -535,6 +535,10 @@ input[readonly] {
   background: rgba(248, 81, 73, 0.18);
   color: var(--red);
 }
+.st-new {
+  background: rgba(91, 140, 255, 0.2);
+  color: var(--accent);
+}
 
 /* ---- placeholder ----------------------------------------------------- */
 .placeholder {
@@ -583,6 +587,29 @@ input[readonly] {
   to {
     transform: rotate(360deg);
   }
+}
+
+.progress-wrap {
+  width: 320px;
+  max-width: 70vw;
+  margin-top: 4px;
+}
+.progress-bar {
+  height: 6px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.15s ease;
+}
+.progress-count {
+  margin-top: 6px;
+  font-size: 12px;
+  text-align: center;
 }
 
 /* ---- diff viewer ----------------------------------------------------- */

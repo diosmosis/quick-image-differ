@@ -32,6 +32,46 @@ This is a document of iterations that need to be made or have already been made 
 
    **Status: ❌ Invalid — no change made.** The archive selected by mistake already contained diff images (highlights baked into the artifact files themselves). The app was serving the unmodified artifact correctly: verified that the "Artifact" pane is served the raw artifact file (byte-identical to disk) and that pixelmatch only writes highlights into the separate diff image, never onto the artifact. Nothing to fix.
 
+8. when the app starts, and an artifact that was selected in a previous run is selected in the current run. but the selected artifact is not downloaded/diffed. it should be.
+
+   **Status: ✅ Done.** Extracted the download-and-diff step into a shared `runDiff()` and call it from the startup restore path, so the restored artifact is now automatically downloaded and diffed on launch (served from the local cache when available — see #9). Repo/run/baseline are passed explicitly to `runDiff` because the corresponding React state hasn't settled yet during restore. (`src/renderer/src/App.jsx`)
+
+9. artifacts should be cached locally (at most 300mb). if a specific artifact is newer than what is stored locally, it should be redownloaded.
+
+   **Status: ✅ Done.** Added `ArtifactCache` (`src/main/cache.js`): downloaded artifact zips are stored under `userData/artifact-cache/` with a JSON index. On a diff request the cache is checked first — a hit is served without any network call; a miss (or an artifact whose `createdAt` is newer than the cached copy) triggers a download that is then cached. Total cache size is capped at 300 MB with least-recently-accessed eviction (never evicting the just-downloaded artifact). Cache hits are shown as "· cached" in the diff toolbar. Unit-tested hit/miss, newer-upstream invalidation, LRU eviction under the cap, and persistence. (`src/main/cache.js` (new), `src/main/ipc.js`, `src/renderer/src/App.jsx`, `src/renderer/src/components/DiffViewer.jsx`)
+
+10. each github source selector needs a refresh button that refreshes the selector's contents.
+
+    **Status: ✅ Done.** All four selectors now expose a Refresh action in their popover header. Repository already had one; added `refreshWorkflows` / `refreshRuns` / `refreshArtifacts`, which re-fetch just that selector's contents without disturbing the current selection or the downstream selectors. (`src/renderer/src/App.jsx`)
+
+11. in the workflow selector, after refreshing, when a workflow appears that hasn't appeared before (ie, is new), it should be marked visually as being new.
+
+    **Status: ✅ Done.** `refreshWorkflows` diffs the freshly-fetched workflow ids against the previously-displayed set; any id not seen before is tracked in `newWorkflowIds` and shown with a blue "New" badge in the workflow list. The markers are recomputed on each refresh and cleared when a different repository is selected. (`src/renderer/src/App.jsx`, `src/renderer/src/styles.css`)
+
+12. in the workflow selector, display the message of the commit that triggered the workflow in small text under each workflow. (if triggered manually, just say manual).
+
+    **Status: ✅ Done.** Implemented on the **Workflow run** selector — a workflow *definition* has no triggering commit; only runs do, and "manual" (`workflow_dispatch`) is a run-level event. `listRuns` returns `headCommitMessage` (from the run's `head_commit.message`), and each run's small subtitle shows the first line of that commit message, or "Manual" when started by hand. Follow-up: the runs list sometimes omits `head_commit`, which showed the bare event name ("push") instead of the commit message; `listRuns` now fetches the commit message directly by `head_sha` for any run missing it (deduped by sha, fetched in parallel), with `display_title` as a further fallback, so push-triggered runs display the message of the pushed commit. (`src/main/github.js`, `src/renderer/src/App.jsx`)
+
+13. in the artifact selector, do not display artifact files that start with "diff-"
+
+    **Status: ✅ Done.** The `github:listArtifacts` IPC handler now filters out any artifact whose name starts with `diff-` before returning the list. Filtering at this single point keeps them out of the selector, its refresh, and the startup-restore path uniformly. (`src/main/ipc.js`)
+
+14. in the diff viewer, the file selector on the left hand side should be navigable by keyboard (ie, up arrow moves the current selection up, the down arrow moves the current selection down).
+
+    **Status: ✅ Done.** Added a window `keydown` handler in the diff viewer: ArrowUp/ArrowDown move the selection up/down within the currently filtered list (clamped at the ends). It is ignored while focus is in a text input (so the popover filter boxes still work), and the selected row is scrolled into view as the selection moves. (`src/renderer/src/components/DiffViewer.jsx`)
+
+15. when the copy artifact -> baseline button is pressed, and the artifact is copied over, and the diff on the left hand is removed from the view (because the images match and it no longer matches the selected "Different" filter), the selected file moves to the first in the list. this should not happen, instead it should remain at the same position as it was before. so, if the 2nd image in the list is selected, and the user copies that file over to the baseline folder, when the list refreshes, the second item in the list should still be selected. this allows the user to quickly view differences without having to re-select a file, when the user is not able to copy over one or more files (because the difference is may not be valid).
+
+    **Status: ✅ Done.** The "keep selection valid" effect now tracks the selection's position (`lastIndexRef`) and, when the selected item drops out of the filtered list, selects the item that now occupies the same index (clamped to the list length) instead of jumping to the top. So resolving the 2nd item leaves the selection on what is now the 2nd item, letting the user step straight through the diffs. Also reworked the post-resolve image refresh to reload via a token (`imgRefresh`) rather than re-fetching the old key, avoiding a stale-image race now that the selection can move. (`src/renderer/src/components/DiffViewer.jsx`)
+
+16. the "Downloading & comparing images" loading status seems to take a long time even with a file cache. please provide more context about progress within this process so the user can see progress being made.
+
+    **Status: ✅ Done.** The slow part even on a cache hit is decoding + pixel-diffing every image, which ran as one opaque blocking step. The `diff:download` handler now streams `diff:progress` events through the phases — download / extract / compare — and during the compare phase reports `done`/`total` and yields to the event loop (`setImmediate`) so the updates actually flush (pixelmatch is synchronous and would otherwise block until the whole loop finished). The renderer subscribes via a new `onDiffProgress` preload bridge and the loading screen now shows the current phase message plus a progress bar and an "N / M images compared" counter. (`src/main/ipc.js`, `src/preload/index.js`, `src/renderer/src/App.jsx`, `src/renderer/src/styles.css`)
+
+17. run the image comparison in the background so it never blocks the main process / UI.
+
+    **Status: ✅ Done.** Moved the CPU-bound decode + pixelmatch work off the main thread onto a pool of worker threads. Extracted the per-pair comparison into `compareImagePair()` (`imagediff.js`); a worker script (`diff-worker.js`) runs it per message, and `DiffWorkerPool` (`worker-pool.js`) spawns one worker per core (capped at 8), queues tasks, dispatches to idle workers, and replaces any crashed worker (resolving its in-flight task as an error so a diff never hangs). `diff:download` now does download/extract on the main thread, resolves trivial added/missing entries inline, and runs the actual image comparisons in parallel on the pool — so the main process (dialogs, GitHub calls, progress events, window) stays responsive, and diffs also complete faster. The pool is created once and torn down on `will-quit`. Built the worker as a sibling of `index.js` via an added electron-vite input; verified end-to-end (spawned the built worker, confirmed correct statuses and usable diff-PNG buffers) and via a clean app boot. (`src/main/worker-pool.js` (new), `src/main/diff-worker.js` (new), `src/main/imagediff.js`, `src/main/ipc.js`, `electron.vite.config.mjs`)
+
 ## Verification notes
 
 - `npm run build` succeeds for main, preload and renderer.

@@ -10,7 +10,11 @@ export default defineConfig({
     plugins: [externalizeDepsPlugin()],
     build: {
       rollupOptions: {
-        input: resolve(__dirname, 'src/main/index.js')
+        input: {
+          index: resolve(__dirname, 'src/main/index.js'),
+          // Built as a sibling of index.js so it can be loaded as a worker.
+          'diff-worker': resolve(__dirname, 'src/main/diff-worker.js')
+        }
       }
     }
   },

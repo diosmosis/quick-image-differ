@@ -84,17 +84,53 @@ export class GitHubClient {
     const data = await this.json(
       `/repos/${owner}/${repo}/actions/workflows/${workflowId}/runs?per_page=30`
     )
-    return (data.workflow_runs || []).map((run) => ({
+    const runs = (data.workflow_runs || []).map((run) => ({
       id: run.id,
       name: run.name,
       runNumber: run.run_number,
       status: run.status,
       conclusion: run.conclusion,
       headBranch: run.head_branch,
+      headSha: run.head_sha,
       event: run.event,
+      // Message of the commit that triggered the run (first line used in the UI).
+      headCommitMessage: run.head_commit?.message || '',
+      // Fallback label GitHub renders for the run (often the commit/PR title).
+      displayTitle: run.display_title || '',
       createdAt: run.created_at,
       htmlUrl: run.html_url
     }))
+
+    // The runs list sometimes omits head_commit; fetch the commit message
+    // directly for those (deduped by sha, in parallel) so push-triggered runs
+    // still show what was pushed.
+    const shas = [
+      ...new Set(
+        runs
+          .filter((r) => !r.headCommitMessage && r.event !== 'workflow_dispatch' && r.headSha)
+          .map((r) => r.headSha)
+      )
+    ]
+    if (shas.length) {
+      const messages = {}
+      await Promise.all(
+        shas.map(async (sha) => {
+          try {
+            const commit = await this.json(`/repos/${owner}/${repo}/commits/${sha}`)
+            messages[sha] = commit.commit?.message || ''
+          } catch {
+            messages[sha] = ''
+          }
+        })
+      )
+      for (const r of runs) {
+        if (!r.headCommitMessage && messages[r.headSha]) {
+          r.headCommitMessage = messages[r.headSha]
+        }
+      }
+    }
+
+    return runs
   }
 
   async listArtifacts(owner, repo, runId) {

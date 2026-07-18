@@ -22,7 +22,15 @@ const api = {
   // diffing
   downloadAndDiff: (args) => ipcRenderer.invoke('diff:download', args),
   getImages: (key) => ipcRenderer.invoke('diff:getImages', key),
-  resolveDiff: (key) => ipcRenderer.invoke('diff:resolve', key)
+  resolveDiff: (key) => ipcRenderer.invoke('diff:resolve', key),
+
+  // progress updates while a diff is downloading/comparing; returns an
+  // unsubscribe function.
+  onDiffProgress: (cb) => {
+    const listener = (_e, payload) => cb(payload)
+    ipcRenderer.on('diff:progress', listener)
+    return () => ipcRenderer.removeListener('diff:progress', listener)
+  }
 }
 
 contextBridge.exposeInMainWorld('api', api)

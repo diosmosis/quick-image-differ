@@ -6,11 +6,11 @@ import { ipcMain, dialog, shell, BrowserWindow } from 'electron'
 import AdmZip from 'adm-zip'
 
 import { GitHubClient } from './github'
+import { ArtifactCache } from './cache'
+import { DiffWorkerPool } from './worker-pool'
 import {
   collectImages,
   alignArtifactKeys,
-  decode,
-  diffDecoded,
   fileToDataUrl,
   bufferToDataUrl
 } from './imagediff'
@@ -26,6 +26,11 @@ function parseRepo(fullName) {
 }
 
 export function registerIpc(app, store) {
+  const cache = new ArtifactCache(app)
+  // Persistent pool of worker threads that do the CPU-bound image comparison,
+  // so downloads/diffs never block the main process (or, in turn, the UI).
+  const pool = new DiffWorkerPool()
+  app.on('will-quit', () => pool.destroy())
   const client = () => {
     const token = store.get('token')
     if (!token) throw new Error('No GitHub token configured. Add one in Setup.')
@@ -99,19 +104,42 @@ export function registerIpc(app, store) {
 
   ipcMain.handle('github:listArtifacts', async (_e, { repo, runId }) => {
     const { owner, name } = parseRepo(repo)
-    return client().listArtifacts(owner, name, runId)
+    const artifacts = await client().listArtifacts(owner, name, runId)
+    // Hide diff-output artifacts (named "diff-…") from the selector.
+    return artifacts.filter((a) => !a.name.startsWith('diff-'))
   })
 
   // ---- Download artifact + diff against baseline ------------------------
-  ipcMain.handle('diff:download', async (_e, { repo, runId, artifactId, artifactName }) => {
+  ipcMain.handle('diff:download', async (_e, { repo, runId, artifactId, artifactName, createdAt }) => {
+    // Report progress back to the renderer so the loading screen can show what
+    // is happening (download → extract → compare N images).
+    const progress = (payload) => {
+      try {
+        _e.sender.send('diff:progress', payload)
+      } catch {
+        /* window may have closed */
+      }
+    }
+
     const baselineRoot = store.get('baselineFolder')
     if (!baselineRoot) throw new Error('Select a baseline folder first.')
     if (!fs.existsSync(baselineRoot)) throw new Error(`Baseline folder not found: ${baselineRoot}`)
 
     const { owner, name } = parseRepo(repo)
-    const zipBuf = await client().downloadArtifactZip(owner, name, artifactId)
+    // Serve from the local cache when we already have this artifact (and it is
+    // not newer upstream); otherwise download and cache it.
+    let zipBuf = cache.get(artifactId, createdAt)
+    const fromCache = zipBuf !== null
+    if (!fromCache) {
+      progress({ phase: 'download', message: 'Downloading artifact…' })
+      zipBuf = await client().downloadArtifactZip(owner, name, artifactId)
+      cache.put(artifactId, artifactName, createdAt, zipBuf)
+    } else {
+      progress({ phase: 'download', message: 'Loading artifact from cache…' })
+    }
 
     // Extract into a fresh temp dir.
+    progress({ phase: 'extract', message: 'Extracting artifact…' })
     const destDir = path.join(os.tmpdir(), 'quick-image-differ', `${runId}-${artifactId}`)
     fs.rmSync(destDir, { recursive: true, force: true })
     fs.mkdirSync(destDir, { recursive: true })
@@ -128,8 +156,11 @@ export function registerIpc(app, store) {
     const keys = Array.from(new Set([...artifactImages.keys(), ...baselineImages.keys()])).sort()
 
     const entries = new Map()
-    const summary = []
+    const pairTasks = []
+    let taskId = 0
 
+    // First pass (cheap, on the main thread): create every entry and resolve the
+    // trivial statuses; queue the real image comparisons as worker tasks.
     for (const key of keys) {
       const artifactPath = artifactImages.get(key) || null
       const baselinePath = baselineImages.get(key) || null
@@ -148,50 +179,59 @@ export function registerIpc(app, store) {
         error: null,
         diffPng: null
       }
-
-      try {
-        if (artifactPath && !baselinePath) {
-          entry.status = 'added' // only in artifact, no baseline yet
-        } else if (!artifactPath && baselinePath) {
-          entry.status = 'missing' // in baseline but not produced by the build
-        } else {
-          const a = decode(artifactPath)
-          const b = decode(baselinePath)
-          if (a && b) {
-            entry.decodable = true
-            const { mismatch, total, diffPng, sizeChanged } = diffDecoded(a, b)
-            entry.diffPng = diffPng
-            entry.diffPixels = mismatch
-            entry.diffPercent = total ? (mismatch / total) * 100 : 0
-            entry.sizeChanged = sizeChanged
-            entry.status = mismatch === 0 && !sizeChanged ? 'identical' : 'different'
-          } else {
-            // Undecodable format (gif/bmp/webp): fall back to byte comparison.
-            const same =
-              fs.statSync(artifactPath).size === fs.statSync(baselinePath).size &&
-              fs.readFileSync(artifactPath).equals(fs.readFileSync(baselinePath))
-            entry.status = same ? 'identical' : 'different'
-          }
-        }
-      } catch (err) {
-        entry.status = 'error'
-        entry.error = err.message
-      }
-
       entries.set(key, entry)
-      summary.push({
-        key: entry.key,
-        name: entry.name,
-        status: entry.status,
-        diffPixels: entry.diffPixels,
-        diffPercent: entry.diffPercent,
-        sizeChanged: entry.sizeChanged,
-        decodable: entry.decodable,
-        hasArtifact: Boolean(artifactPath),
-        hasBaseline: Boolean(baselinePath),
-        error: entry.error
-      })
+
+      if (artifactPath && !baselinePath) {
+        entry.status = 'added' // only in artifact, no baseline yet
+      } else if (!artifactPath && baselinePath) {
+        entry.status = 'missing' // in baseline but not produced by the build
+      } else {
+        pairTasks.push({ id: taskId++, key, artifactPath, baselinePath })
+      }
     }
+
+    // Second pass: run the comparisons on the worker pool (in parallel, off the
+    // main thread), updating progress as each result arrives.
+    const total = keys.length
+    let processed = total - pairTasks.length
+    const step = Math.max(1, Math.floor(total / 100))
+    progress({ phase: 'compare', message: 'Comparing images…', done: processed, total })
+
+    await Promise.all(
+      pairTasks.map((task) =>
+        pool.run(task).then((res) => {
+          const entry = entries.get(res.key)
+          entry.status = res.status
+          entry.diffPixels = res.diffPixels
+          entry.diffPercent = res.diffPercent
+          entry.sizeChanged = res.sizeChanged
+          entry.decodable = res.decodable
+          entry.error = res.error
+          entry.diffPng = res.diffPng
+          processed++
+          if (processed % step === 0 || processed === total) {
+            progress({ phase: 'compare', done: processed, total })
+          }
+        })
+      )
+    )
+
+    // Build the summary in sorted key order (results arrive out of order).
+    const summary = keys.map((key) => {
+      const e = entries.get(key)
+      return {
+        key: e.key,
+        name: e.name,
+        status: e.status,
+        diffPixels: e.diffPixels,
+        diffPercent: e.diffPercent,
+        sizeChanged: e.sizeChanged,
+        decodable: e.decodable,
+        hasArtifact: Boolean(e.artifactPath),
+        hasBaseline: Boolean(e.baselinePath),
+        error: e.error
+      }
+    })
 
     session = { baselineRoot, extractDir: destDir, artifactName, entries }
 
@@ -200,7 +240,7 @@ export function registerIpc(app, store) {
       return acc
     }, {})
 
-    return { artifactName, strippedPrefix, total: summary.length, counts, items: summary }
+    return { artifactName, strippedPrefix, fromCache, total: summary.length, counts, items: summary }
   })
 
   // ---- Lazily fetch the three images for one entry ----------------------

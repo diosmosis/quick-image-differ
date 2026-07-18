@@ -140,6 +140,43 @@ export function diffDecoded(a, b) {
   }
 }
 
+// Compare a single artifact/baseline image pair. Pure and self-contained so it
+// can run on a worker thread. Returns the per-image diff outcome.
+export function compareImagePair(artifactPath, baselinePath) {
+  const result = {
+    status: 'unknown',
+    diffPixels: 0,
+    diffPercent: 0,
+    sizeChanged: false,
+    decodable: false,
+    error: null,
+    diffPng: null
+  }
+  try {
+    const a = decode(artifactPath)
+    const b = decode(baselinePath)
+    if (a && b) {
+      result.decodable = true
+      const { mismatch, total, diffPng, sizeChanged } = diffDecoded(a, b)
+      result.diffPng = diffPng
+      result.diffPixels = mismatch
+      result.diffPercent = total ? (mismatch / total) * 100 : 0
+      result.sizeChanged = sizeChanged
+      result.status = mismatch === 0 && !sizeChanged ? 'identical' : 'different'
+    } else {
+      // Undecodable format (gif/bmp/webp): fall back to byte comparison.
+      const same =
+        fs.statSync(artifactPath).size === fs.statSync(baselinePath).size &&
+        fs.readFileSync(artifactPath).equals(fs.readFileSync(baselinePath))
+      result.status = same ? 'identical' : 'different'
+    }
+  } catch (err) {
+    result.status = 'error'
+    result.error = err.message
+  }
+  return result
+}
+
 export function fileToDataUrl(filePath) {
   const ext = path.extname(filePath).toLowerCase()
   const mime = MIME[ext] || 'application/octet-stream'
