@@ -1,0 +1,27 @@
+{
+  "name": "quick-image-differ",
+  "version": "1.0.0",
+  "description": "Compare images in a GitHub Actions artifact against a folder of baseline images.",
+  "author": "",
+  "license": "MIT",
+  "main": "./out/main/index.js",
+  "scripts": {
+    "dev": "NO_SANDBOX=1 electron-vite dev",
+    "build": "electron-vite build",
+    "start": "NO_SANDBOX=1 electron-vite preview"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.16",
+    "jpeg-js": "^0.4.4",
+    "pixelmatch": "^5.3.0",
+    "pngjs": "^7.0.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^31.7.7",
+    "electron-vite": "^2.3.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "vite": "^5.4.11"
+  }
+}

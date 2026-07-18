@@ -1,0 +1,442 @@
+import React, { useEffect, useState } from 'react'
+import Setup from './components/Setup'
+import PopoverSelect from './components/PopoverSelect'
+import DiffViewer from './components/DiffViewer'
+
+const api = window.api
+
+// Small badge helpers for the step lists.
+function runBadge(run) {
+  const c = run.conclusion || run.status
+  const cls =
+    c === 'success' ? 'st-identical' : c === 'failure' ? 'st-error' : 'st-added'
+  return <span className={`badge ${cls}`}>{c}</span>
+}
+
+export default function App() {
+  const [settings, setSettings] = useState({ hasToken: false })
+  const [user, setUser] = useState(null)
+  const [globalError, setGlobalError] = useState(null)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+
+  // GitHub selection chain
+  const [repos, setRepos] = useState([])
+  const [reposState, setReposState] = useState({ loading: false, error: null })
+  const [selectedRepo, setSelectedRepo] = useState(null)
+
+  const [workflows, setWorkflows] = useState([])
+  const [wfState, setWfState] = useState({ loading: false, error: null })
+  const [selectedWorkflow, setSelectedWorkflow] = useState(null)
+
+  const [runs, setRuns] = useState([])
+  const [runsState, setRunsState] = useState({ loading: false, error: null })
+  const [selectedRun, setSelectedRun] = useState(null)
+
+  const [artifacts, setArtifacts] = useState([])
+  const [artState, setArtState] = useState({ loading: false, error: null })
+  const [selectedArtifact, setSelectedArtifact] = useState(null)
+
+  // Diff
+  const [diffResult, setDiffResult] = useState(null)
+  const [diffState, setDiffState] = useState({ loading: false, error: null })
+
+  // ---- initial load -----------------------------------------------------
+  useEffect(() => {
+    api.getSettings().then((s) => {
+      setSettings(s)
+      setSidebarCollapsed(Boolean(s.sidebarCollapsed))
+      if (s.hasToken) {
+        loadRepos()
+        api.whoami().then((u) => u && setUser(u))
+        restoreSelections(s)
+      }
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Re-load the persisted repo → workflow → run → artifact chain so the same
+  // selections are shown on the next launch. Each level is only restored if it
+  // still exists on GitHub.
+  const restoreSelections = async (s) => {
+    if (!s.selectedRepo) return
+    setSelectedRepo(s.selectedRepo)
+    setWfState({ loading: true, error: null })
+    let wf
+    try {
+      wf = await api.listWorkflows(s.selectedRepo)
+      setWorkflows(wf)
+      setWfState({ loading: false, error: null })
+    } catch (e) {
+      setWfState({ loading: false, error: e.message })
+      return
+    }
+
+    if (!s.selectedWorkflow || !wf.some((w) => w.id === s.selectedWorkflow.id)) return
+    setSelectedWorkflow(s.selectedWorkflow)
+    setRunsState({ loading: true, error: null })
+    let runsList
+    try {
+      runsList = await api.listRuns(s.selectedRepo, s.selectedWorkflow.id)
+      setRuns(runsList)
+      setRunsState({ loading: false, error: null })
+    } catch (e) {
+      setRunsState({ loading: false, error: e.message })
+      return
+    }
+
+    if (!s.selectedRun || !runsList.some((r) => r.id === s.selectedRun.id)) return
+    setSelectedRun(s.selectedRun)
+    setArtState({ loading: true, error: null })
+    let artsList
+    try {
+      artsList = await api.listArtifacts(s.selectedRepo, s.selectedRun.id)
+      setArtifacts(artsList)
+      setArtState({ loading: false, error: null })
+    } catch (e) {
+      setArtState({ loading: false, error: e.message })
+      return
+    }
+
+    if (s.selectedArtifact && artsList.some((a) => a.id === s.selectedArtifact.id)) {
+      setSelectedArtifact(s.selectedArtifact)
+    }
+  }
+
+  // ---- token / folder ---------------------------------------------------
+  const verifyToken = async (token) => {
+    if (token === '__clear__') {
+      await api.saveSettings({
+        token: '',
+        selectedRepo: null,
+        selectedWorkflow: null,
+        selectedRun: null,
+        selectedArtifact: null
+      })
+      const s = await api.getSettings()
+      setSettings(s)
+      setUser(null)
+      resetFrom('repo')
+      setRepos([])
+      return
+    }
+    const u = await api.verifyToken(token)
+    setUser(u)
+    const s = await api.getSettings()
+    setSettings(s)
+    loadRepos()
+  }
+
+  const selectFolder = async () => {
+    const folder = await api.selectFolder()
+    if (folder) setSettings((prev) => ({ ...prev, baselineFolder: folder }))
+  }
+
+  // ---- step loaders -----------------------------------------------------
+  const loadRepos = async () => {
+    setReposState({ loading: true, error: null })
+    try {
+      const r = await api.listRepos()
+      setRepos(r)
+      setReposState({ loading: false, error: null })
+    } catch (e) {
+      setReposState({ loading: false, error: e.message })
+    }
+  }
+
+  const resetFrom = (level) => {
+    // Clear selections downstream of the given level.
+    const order = ['repo', 'workflow', 'run', 'artifact', 'diff']
+    const idx = order.indexOf(level)
+    if (idx <= order.indexOf('repo')) {
+      setSelectedRepo(null)
+      setWorkflows([])
+    }
+    if (idx <= order.indexOf('workflow')) {
+      setSelectedWorkflow(null)
+      setRuns([])
+    }
+    if (idx <= order.indexOf('run')) {
+      setSelectedRun(null)
+      setArtifacts([])
+    }
+    if (idx <= order.indexOf('artifact')) {
+      setSelectedArtifact(null)
+    }
+    if (idx <= order.indexOf('diff')) {
+      setDiffResult(null)
+      setDiffState({ loading: false, error: null })
+    }
+  }
+
+  const pickRepo = async (repoFullName) => {
+    resetFrom('workflow')
+    setSelectedRepo(repoFullName)
+    // Persist the selection (and clear any stale downstream selections).
+    api.saveSettings({
+      selectedRepo: repoFullName,
+      selectedWorkflow: null,
+      selectedRun: null,
+      selectedArtifact: null
+    })
+    setWfState({ loading: true, error: null })
+    try {
+      const wf = await api.listWorkflows(repoFullName)
+      setWorkflows(wf)
+      setWfState({ loading: false, error: null })
+    } catch (e) {
+      setWfState({ loading: false, error: e.message })
+    }
+  }
+
+  const pickWorkflow = async (wf) => {
+    resetFrom('run')
+    setSelectedWorkflow(wf)
+    api.saveSettings({ selectedWorkflow: wf, selectedRun: null, selectedArtifact: null })
+    setRunsState({ loading: true, error: null })
+    try {
+      const r = await api.listRuns(selectedRepo, wf.id)
+      setRuns(r)
+      setRunsState({ loading: false, error: null })
+    } catch (e) {
+      setRunsState({ loading: false, error: e.message })
+    }
+  }
+
+  const pickRun = async (run) => {
+    resetFrom('artifact')
+    setSelectedRun(run)
+    api.saveSettings({ selectedRun: run, selectedArtifact: null })
+    setArtState({ loading: true, error: null })
+    try {
+      const a = await api.listArtifacts(selectedRepo, run.id)
+      setArtifacts(a)
+      setArtState({ loading: false, error: null })
+    } catch (e) {
+      setArtState({ loading: false, error: e.message })
+    }
+  }
+
+  const pickArtifact = async (artifact) => {
+    setSelectedArtifact(artifact)
+    api.saveSettings({ selectedArtifact: artifact })
+    setDiffResult(null)
+    if (!settings.baselineFolder) {
+      setDiffState({ loading: false, error: 'Select a baseline folder first (step 1).' })
+      return
+    }
+    if (artifact.expired) {
+      setDiffState({ loading: false, error: 'This artifact has expired and cannot be downloaded.' })
+      return
+    }
+    setDiffState({ loading: true, error: null })
+    try {
+      const res = await api.downloadAndDiff({
+        repo: selectedRepo,
+        runId: selectedRun.id,
+        artifactId: artifact.id,
+        artifactName: artifact.name
+      })
+      setDiffResult(res)
+      setDiffState({ loading: false, error: null })
+    } catch (e) {
+      setDiffState({ loading: false, error: e.message })
+    }
+  }
+
+  const resolveDiff = async (key) => {
+    const updated = await api.resolveDiff(key)
+    setDiffResult((prev) => {
+      if (!prev) return prev
+      const items = prev.items.map((it) => (it.key === key ? { ...it, ...updated } : it))
+      const counts = items.reduce((acc, it) => {
+        acc[it.status] = (acc[it.status] || 0) + 1
+        return acc
+      }, {})
+      return { ...prev, items, counts }
+    })
+  }
+
+  const toggleSidebar = () => {
+    setSidebarCollapsed((v) => {
+      const next = !v
+      api.saveSettings({ sidebarCollapsed: next })
+      return next
+    })
+  }
+
+  const ready = settings.hasToken || user
+
+  return (
+    <div className={`app ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
+      <aside className="sidebar">
+        <div className="brand">
+          <span className="brand-mark">⧉</span>
+          <span className="brand-text">Quick Image Differ</span>
+          <button
+            className="collapse-btn"
+            onClick={toggleSidebar}
+            title="Collapse sidebar"
+            aria-label="Collapse sidebar"
+          >
+            ‹
+          </button>
+        </div>
+
+        <Setup
+          settings={settings}
+          user={user}
+          onVerifyToken={verifyToken}
+          onSelectFolder={selectFolder}
+          busy={false}
+        />
+
+        <div className="card selectors">
+          <div className="card-title">2 · GitHub source</div>
+
+          <PopoverSelect
+            label="Repository"
+            value={selectedRepo}
+            placeholder="Select a repository"
+            items={repos}
+            loading={reposState.loading}
+            error={reposState.error}
+            selectedId={selectedRepo}
+            getId={(r) => r.fullName}
+            getPrimary={(r) => r.fullName}
+            getSecondary={(r) =>
+              `${r.private ? 'private' : 'public'} · pushed ${new Date(r.pushedAt).toLocaleDateString()}`
+            }
+            onSelect={(r) => pickRepo(r.fullName)}
+            onRefresh={loadRepos}
+            disabled={!ready}
+            disabledHint="Add a GitHub token first"
+            emptyText="No repositories match."
+            searchable
+            searchPlaceholder="Filter repositories, or type owner/repo…"
+            renderFooter={(query, close) => {
+              const val = query.trim()
+              if (!/^[^/]+\/[^/]+$/.test(val)) return null
+              if (repos.some((r) => r.fullName.toLowerCase() === val.toLowerCase())) return null
+              return (
+                <button
+                  className="popover-action"
+                  onClick={() => {
+                    pickRepo(val)
+                    close()
+                  }}
+                >
+                  Use “{val}”
+                </button>
+              )
+            }}
+          />
+
+          <PopoverSelect
+            label="Workflow"
+            value={selectedWorkflow?.name || null}
+            placeholder="Select a workflow"
+            items={workflows}
+            loading={wfState.loading}
+            error={wfState.error}
+            selectedId={selectedWorkflow?.id}
+            getId={(w) => w.id}
+            getPrimary={(w) => w.name}
+            getSecondary={(w) => w.path}
+            onSelect={pickWorkflow}
+            disabled={!selectedRepo}
+            disabledHint="Select a repository first"
+            emptyText="No workflows found."
+            searchable
+            searchPlaceholder="Filter workflows…"
+          />
+
+          <PopoverSelect
+            label="Workflow run"
+            value={selectedRun ? `#${selectedRun.runNumber} · ${selectedRun.headBranch || ''}` : null}
+            placeholder="Select a run"
+            items={runs}
+            loading={runsState.loading}
+            error={runsState.error}
+            selectedId={selectedRun?.id}
+            getId={(r) => r.id}
+            getPrimary={(r) => `#${r.runNumber} · ${r.headBranch || ''}`}
+            getSecondary={(r) => new Date(r.createdAt).toLocaleString()}
+            getBadge={runBadge}
+            onSelect={pickRun}
+            disabled={!selectedWorkflow}
+            disabledHint="Select a workflow first"
+            emptyText="No runs found."
+            searchable
+            searchPlaceholder="Filter runs…"
+          />
+
+          <PopoverSelect
+            label="Artifact"
+            value={selectedArtifact?.name || null}
+            placeholder="Select an artifact"
+            items={artifacts}
+            loading={artState.loading}
+            error={artState.error}
+            selectedId={selectedArtifact?.id}
+            getId={(a) => a.id}
+            getPrimary={(a) => a.name}
+            getSecondary={(a) =>
+              `${(a.sizeInBytes / 1024).toFixed(0)} KB${a.expired ? ' · expired' : ''}`
+            }
+            onSelect={pickArtifact}
+            disabled={!selectedRun}
+            disabledHint="Select a run first"
+            emptyText="No artifacts on this run."
+          />
+        </div>
+      </aside>
+
+      <main className="main">
+        {sidebarCollapsed && (
+          <button
+            className="expand-btn"
+            onClick={toggleSidebar}
+            title="Show sidebar"
+            aria-label="Show sidebar"
+          >
+            ›
+          </button>
+        )}
+        {globalError && <div className="banner error">{globalError}</div>}
+        {diffState.loading ? (
+          <div className="placeholder">
+            <div className="spinner" />
+            <p>Downloading artifact and comparing images…</p>
+          </div>
+        ) : diffState.error ? (
+          <div className="placeholder">
+            <div className="banner error">{diffState.error}</div>
+          </div>
+        ) : diffResult ? (
+          <DiffViewer
+            result={diffResult}
+            getImages={(key) => api.getImages(key)}
+            onResolve={resolveDiff}
+            baselineFolder={settings.baselineFolder}
+          />
+        ) : (
+          <div className="placeholder">
+            <div className="placeholder-art">⧉</div>
+            <h2>Quick Image Differ</h2>
+            <p>
+              Configure a GitHub token and a baseline folder, then pick a repository, workflow,
+              run and artifact. Its images will be compared against your baseline folder here.
+            </p>
+            <ol className="placeholder-steps">
+              <li className={settings.hasToken || user ? 'done' : ''}>Add a GitHub token</li>
+              <li className={settings.baselineFolder ? 'done' : ''}>Choose a baseline folder</li>
+              <li className={selectedRepo ? 'done' : ''}>Select a repository</li>
+              <li className={selectedWorkflow ? 'done' : ''}>Pick a workflow &amp; run</li>
+              <li className={selectedArtifact ? 'done' : ''}>Select an artifact to diff</li>
+            </ol>
+          </div>
+        )}
+      </main>
+    </div>
+  )
+}
