@@ -8,7 +8,9 @@
   "scripts": {
     "dev": "NO_SANDBOX=1 electron-vite dev",
     "build": "electron-vite build",
-    "start": "NO_SANDBOX=1 electron-vite preview"
+    "start": "NO_SANDBOX=1 electron-vite preview",
+    "app": "./launch.sh",
+    "desktop:install": "install -Dm644 assets/quick-image-differ.desktop \"$HOME/.local/share/applications/quick-image-differ.desktop\" && update-desktop-database \"$HOME/.local/share/applications\""
   },
   "dependencies": {
     "adm-zip": "^0.5.16",
