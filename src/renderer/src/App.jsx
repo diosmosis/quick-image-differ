@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 import Setup from './components/Setup'
 import PopoverSelect from './components/PopoverSelect'
 import DiffViewer from './components/DiffViewer'
@@ -72,6 +72,10 @@ export default function App() {
   const [diffResult, setDiffResult] = useState(null)
   const [diffState, setDiffState] = useState({ loading: false, error: null })
   const [diffProgress, setDiffProgress] = useState(null)
+  // Id of the diff request whose progress/result we currently care about. A
+  // request started while an older one is still running supersedes it, and the
+  // older one's late progress events and result are ignored.
+  const diffReqRef = useRef(0)
 
   // ---- initial load -----------------------------------------------------
   useEffect(() => {
@@ -87,9 +91,14 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Progress updates streamed from the main process during a diff.
+  // Progress updates streamed from the main process during a diff. Events from
+  // a superseded diff are dropped, otherwise two interleaved progress streams
+  // would make the loading screen jump back and forth.
   useEffect(() => {
-    const off = api.onDiffProgress((p) => setDiffProgress(p))
+    const off = api.onDiffProgress((p) => {
+      if (p?.requestId !== diffReqRef.current) return
+      setDiffProgress(p)
+    })
     return off
   }, [])
 
@@ -210,8 +219,12 @@ export default function App() {
       setSelectedArtifact(null)
     }
     if (idx <= order.indexOf('diff')) {
+      // Orphan any diff still in flight so it can't populate the view we are
+      // clearing here.
+      diffReqRef.current += 1
       setDiffResult(null)
       setDiffState({ loading: false, error: null })
+      setDiffProgress(null)
     }
   }
 
@@ -308,6 +321,12 @@ export default function App() {
   // works both from a click (using component state) and from startup restore
   // (where that state hasn't settled yet).
   const runDiff = async ({ repo, runId, artifact, baselineFolder }) => {
+    // Claim this diff as the current one; anything still in flight for an older
+    // request id is now stale (the main process cancels its work too).
+    const requestId = diffReqRef.current + 1
+    diffReqRef.current = requestId
+    const isCurrent = () => diffReqRef.current === requestId
+
     setDiffResult(null)
     if (!baselineFolder) {
       setDiffState({ loading: false, error: 'Select a baseline folder first (step 1).' })
@@ -317,7 +336,7 @@ export default function App() {
       setDiffState({ loading: false, error: 'This artifact has expired and cannot be downloaded.' })
       return
     }
-    setDiffProgress({ phase: 'download', message: 'Preparing…' })
+    setDiffProgress({ phase: 'download', message: 'Preparing…', requestId })
     setDiffState({ loading: true, error: null })
     try {
       const res = await api.downloadAndDiff({
@@ -325,14 +344,19 @@ export default function App() {
         runId,
         artifactId: artifact.id,
         artifactName: artifact.name,
-        createdAt: artifact.createdAt
+        createdAt: artifact.createdAt,
+        requestId
       })
+      // Another artifact was selected while this diff was running — its result
+      // owns the screen now.
+      if (!isCurrent() || res?.cancelled) return
       setDiffResult(res)
       setDiffState({ loading: false, error: null })
     } catch (e) {
+      if (!isCurrent()) return
       setDiffState({ loading: false, error: e.message })
     } finally {
-      setDiffProgress(null)
+      if (isCurrent()) setDiffProgress(null)
     }
   }
 
@@ -346,6 +370,11 @@ export default function App() {
       baselineFolder: settings.baselineFolder
     })
   }
+
+  // Stable identity: the diff viewer re-loads the selected entry's images
+  // whenever this prop changes, so an inline arrow here would reload (and
+  // visibly flash) the panes on every re-render of this component.
+  const getImages = useCallback((key) => api.getImages(key), [])
 
   const resolveDiff = async (key) => {
     const updated = await api.resolveDiff(key)
@@ -548,7 +577,7 @@ export default function App() {
         ) : diffResult ? (
           <DiffViewer
             result={diffResult}
-            getImages={(key) => api.getImages(key)}
+            getImages={getImages}
             onResolve={resolveDiff}
             baselineFolder={settings.baselineFolder}
           />

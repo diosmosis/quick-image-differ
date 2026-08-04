@@ -20,6 +20,12 @@ import {
 // key -> { status, artifactPath, baselinePath, diffPng, ... }
 let session = { baselineRoot: null, entries: new Map() }
 
+// The diff currently being computed. Starting a new diff cancels the previous
+// one: it stops emitting progress, releases its queued worker tasks and never
+// publishes its results (or its `session`), so a superseded diff can't fight
+// with the current one over the renderer's progress/result state.
+let activeDiff = null
+
 function parseRepo(fullName) {
   const [owner, name] = String(fullName).split('/')
   return { owner, name }
@@ -117,12 +123,25 @@ export function registerIpc(app, store) {
   })
 
   // ---- Download artifact + diff against baseline ------------------------
-  ipcMain.handle('diff:download', async (_e, { repo, runId, artifactId, artifactName, createdAt }) => {
+  ipcMain.handle('diff:download', async (
+    _e,
+    { repo, runId, artifactId, artifactName, createdAt, requestId = null }
+  ) => {
+    // Supersede any diff still running: it may have hundreds of image
+    // comparisons queued, and both diffs would otherwise stream progress at the
+    // renderer at once.
+    if (activeDiff) activeDiff.cancelled = true
+    const job = { requestId, cancelled: false }
+    activeDiff = job
+    const cancelled = () => job.cancelled
+
     // Report progress back to the renderer so the loading screen can show what
-    // is happening (download → extract → compare N images).
+    // is happening (download → extract → compare N images). Progress carries the
+    // request id so the renderer can tell whose progress it is receiving.
     const progress = (payload) => {
+      if (job.cancelled) return
       try {
-        _e.sender.send('diff:progress', payload)
+        _e.sender.send('diff:progress', { ...payload, requestId })
       } catch {
         /* window may have closed */
       }
@@ -144,6 +163,8 @@ export function registerIpc(app, store) {
     } else {
       progress({ phase: 'download', message: 'Loading artifact from cache…' })
     }
+
+    if (cancelled()) return { cancelled: true, requestId }
 
     // Extract into a fresh temp dir.
     progress({ phase: 'extract', message: 'Extracting artifact…' })
@@ -206,7 +227,10 @@ export function registerIpc(app, store) {
 
     await Promise.all(
       pairTasks.map((task) =>
-        pool.run(task).then((res) => {
+        pool.run(task, cancelled).then((res) => {
+          // Task was dropped because this diff was superseded, or the result
+          // arrived after the fact — either way it is no longer wanted.
+          if (res.cancelled || job.cancelled) return
           const entry = entries.get(res.key)
           entry.status = res.status
           entry.diffPixels = res.diffPixels
@@ -222,6 +246,10 @@ export function registerIpc(app, store) {
         })
       )
     )
+
+    // A superseded diff must not publish its results or overwrite `session` —
+    // the entries the renderer is showing belong to the newer diff.
+    if (cancelled()) return { cancelled: true, requestId }
 
     // Build the summary in sorted key order (results arrive out of order).
     const summary = keys.map((key) => {
@@ -241,13 +269,22 @@ export function registerIpc(app, store) {
     })
 
     session = { baselineRoot, extractDir: destDir, artifactName, entries }
+    if (activeDiff === job) activeDiff = null
 
     const counts = summary.reduce((acc, s) => {
       acc[s.status] = (acc[s.status] || 0) + 1
       return acc
     }, {})
 
-    return { artifactName, strippedPrefix, fromCache, total: summary.length, counts, items: summary }
+    return {
+      requestId,
+      artifactName,
+      strippedPrefix,
+      fromCache,
+      total: summary.length,
+      counts,
+      items: summary
+    }
   })
 
   // ---- Lazily fetch the three images for one entry ----------------------

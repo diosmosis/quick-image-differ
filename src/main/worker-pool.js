@@ -2,6 +2,10 @@
 // are queued and dispatched to the first idle worker; results come back via the
 // promise returned by run(). A crashed worker is replaced and its in-flight
 // task is resolved as an error so a diff never hangs.
+//
+// A task may carry an `isCancelled` predicate: queued tasks belonging to a
+// superseded diff are dropped at dispatch time (resolved as `{ cancelled: true }`)
+// so a newly requested diff isn't stuck behind hundreds of obsolete comparisons.
 import { Worker } from 'node:worker_threads'
 import os from 'node:os'
 import path from 'node:path'
@@ -65,6 +69,20 @@ export class DiffWorkerPool {
   }
 
   _drain() {
+    // Drop queued tasks whose diff has been superseded before dispatching any
+    // work, so the pool is immediately free for the current diff.
+    if (this.queue.length) {
+      const alive = []
+      for (const job of this.queue) {
+        if (job.isCancelled?.()) {
+          job.resolve({ id: job.payload.id, key: job.payload.key, cancelled: true })
+        } else {
+          alive.push(job)
+        }
+      }
+      this.queue = alive
+    }
+
     for (const rec of this.records) {
       if (rec.job || this.queue.length === 0) continue
       const job = this.queue.shift()
@@ -74,9 +92,11 @@ export class DiffWorkerPool {
   }
 
   // payload: { id, key, artifactPath, baselinePath }
-  run(payload) {
+  // isCancelled: optional predicate; when it returns true while the task is
+  // still queued, the task is discarded and resolves as { cancelled: true }.
+  run(payload, isCancelled) {
     return new Promise((resolve) => {
-      this.queue.push({ payload, resolve })
+      this.queue.push({ payload, resolve, isCancelled })
       this._drain()
     })
   }
