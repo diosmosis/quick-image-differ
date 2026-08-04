@@ -187,6 +187,14 @@ input {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* Right-aligned meta on a popover row (e.g. an artifact's upload time). */
+.item-meta {
+  flex: none;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
 .popover-item-secondary {
   font-size: 11px;
   color: var(--muted);

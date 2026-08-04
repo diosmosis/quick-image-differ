@@ -21,6 +21,20 @@ function runSubtitle(run) {
   return msg || run.event || '—'
 }
 
+// Compact local date + time, e.g. "3 Aug, 14:05" — used for artifact upload times.
+function formatDateTime(value) {
+  if (!value) return null
+  const d = new Date(value)
+  if (Number.isNaN(d.getTime())) return null
+  return d.toLocaleString(undefined, {
+    day: 'numeric',
+    month: 'short',
+    year: d.getFullYear() === new Date().getFullYear() ? undefined : 'numeric',
+    hour: '2-digit',
+    minute: '2-digit'
+  })
+}
+
 // Human-readable message for the current diff progress phase.
 function diffProgressMessage(p) {
   if (!p) return 'Preparing…'
@@ -475,6 +489,14 @@ export default function App() {
             selectedId={selectedArtifact?.id}
             getId={(a) => a.id}
             getPrimary={(a) => a.name}
+            getBadge={(a) => {
+              const when = formatDateTime(a.createdAt)
+              return when ? (
+                <span className="item-meta" title={new Date(a.createdAt).toLocaleString()}>
+                  {when}
+                </span>
+              ) : null
+            }}
             getSecondary={(a) =>
               `${(a.sizeInBytes / 1024).toFixed(0)} KB${a.expired ? ' · expired' : ''}`
             }

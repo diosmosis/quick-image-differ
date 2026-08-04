@@ -105,8 +105,15 @@ export function registerIpc(app, store) {
   ipcMain.handle('github:listArtifacts', async (_e, { repo, runId }) => {
     const { owner, name } = parseRepo(repo)
     const artifacts = await client().listArtifacts(owner, name, runId)
-    // Hide diff-output artifacts (named "diff-…") from the selector.
-    return artifacts.filter((a) => !a.name.startsWith('diff-'))
+    // Hide diff-output artifacts (named "diff-…") from the selector, and show
+    // the newest uploads first. Artifacts without a creation time sort last.
+    return artifacts
+      .filter((a) => !a.name.startsWith('diff-'))
+      .sort((a, b) => {
+        const ta = a.createdAt ? new Date(a.createdAt).getTime() : 0
+        const tb = b.createdAt ? new Date(b.createdAt).getTime() : 0
+        return tb - ta
+      })
   })
 
   // ---- Download artifact + diff against baseline ------------------------

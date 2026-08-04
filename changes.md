@@ -72,6 +72,10 @@ This is a document of iterations that need to be made or have already been made 
 
     **Status: ✅ Done.** Moved the CPU-bound decode + pixelmatch work off the main thread onto a pool of worker threads. Extracted the per-pair comparison into `compareImagePair()` (`imagediff.js`); a worker script (`diff-worker.js`) runs it per message, and `DiffWorkerPool` (`worker-pool.js`) spawns one worker per core (capped at 8), queues tasks, dispatches to idle workers, and replaces any crashed worker (resolving its in-flight task as an error so a diff never hangs). `diff:download` now does download/extract on the main thread, resolves trivial added/missing entries inline, and runs the actual image comparisons in parallel on the pool — so the main process (dialogs, GitHub calls, progress events, window) stays responsive, and diffs also complete faster. The pool is created once and torn down on `will-quit`. Built the worker as a sibling of `index.js` via an added electron-vite input; verified end-to-end (spawned the built worker, confirmed correct statuses and usable diff-PNG buffers) and via a clean app boot. (`src/main/worker-pool.js` (new), `src/main/diff-worker.js` (new), `src/main/imagediff.js`, `src/main/ipc.js`, `electron.vite.config.mjs`)
 
+18. in the artifacts dropdown, each artifact should have the datetime it was uploaded next to it. the items should also be sorted by creation time, in a descending order (so newest first).
+
+    **Status: ✅ Done.** The `github:listArtifacts` IPC handler now sorts artifacts by `createdAt` descending (newest first; artifacts with no creation time sort last) right after the existing `diff-` filter — so the selector, its Refresh action and the startup-restore path all get the same order. Each row in the artifact popover shows the upload time right-aligned next to the artifact name, formatted compactly in local time (`3 Aug, 14:05`; the year is included only when it isn't the current year), with the full locale datetime as the row's tooltip. (`src/main/ipc.js`, `src/renderer/src/App.jsx`, `src/renderer/src/styles.css`)
+
 ## Verification notes
 
 - `npm run build` succeeds for main, preload and renderer.
